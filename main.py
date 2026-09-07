@@ -1,85 +1,239 @@
-"""
-main.py  --  Pattern Recognition Module, Day 1
-FYP: An Explainable Intelligent Agent for Price Action Trading using VLMs
-
-Data source : ES futures 5-minute bars (2021-2026), resampled to daily.
-Ticker      : SPY (ES futures used as proxy; same underlying index)
-
-Full pipeline
--------------
-1. Read 14 raw CSV files from data/raw/
-       data_loader.load_raw_csvs()
-2. Resample 5-minute -> daily OHLCV
-       data_loader.resample_to_daily()
-3. Convert rows to KlineBar objects
-       pa_agent_adapter.KlineBar  (adapted from pa_agent/data/base.py)
-4. Sliding window scan (30-day window, step=1 day)
-       pattern_detection.scan()
-       uses classify_bar(), get_overlap_ratio(), get_micro_double(),
-       get_breakout_prev_range() from pa_agent/ai/kline_features.py
-5. Merge duplicate hits from overlapping windows
-       pattern_detection.merge_consecutive_hits()
-6. Save results.csv + one annotated PNG chart per event
-       visualize.plot_event()
-"""
 import os
 import sys
 import pandas as pd
 
 import data_loader
 import pattern_detection as det
+import pa_features
+import market_structure
+import decision_engine
+import explainability
 import visualize
 
-WINDOW_SIZE = 30   # sliding window size in trading days
+
+WINDOW_SIZE = 30
 
 
 def main():
-    for d in ("data/raw", "data", "figures", "output"):
-        os.makedirs(d, exist_ok=True)
 
-    # ── Step 1: Build daily CSV from raw 5-minute files (first run only) ──────
-    if os.path.exists(data_loader.CACHE_CSV):
-        print(f"Found cached daily CSV: {data_loader.CACHE_CSV} -- skipping rebuild.")
+    # ============================================================
+    # 1. Create required directories
+    # ============================================================
+
+    for directory in (
+        "data",
+        "data/raw",
+        "output",
+        "figures",
+    ):
+        os.makedirs(directory, exist_ok=True)
+
+    # ============================================================
+    # 2. Build daily data
+    # ============================================================
+
+    cache_path = data_loader.CACHE_CSV
+
+    if os.path.exists(cache_path):
+        print(
+            f"Found cached daily data: {cache_path}"
+        )
     else:
-        print("First run: building daily CSV from raw 5-minute data...")
+        print(
+            "Daily data not found. "
+            "Building from raw 5-minute CSV files..."
+        )
+
         try:
             data_loader.build_daily_csv()
-        except FileNotFoundError as e:
-            print(f"\nERROR: {e}")
+        except FileNotFoundError as exc:
+            print(f"\nERROR: {exc}")
             sys.exit(1)
 
-    # ── Step 2: Load data and convert to KlineBar list ────────────────────────
-    print("\nLoading data...")
+    # ============================================================
+    # 3. Load daily data and KlineBar objects
+    # ============================================================
+
+    print("\nLoading daily data...")
+
     df, bars = data_loader.csv_to_bars()
 
-    # ── Step 3: Sliding window pattern scan ───────────────────────────────────
-    print(f"\nRunning {WINDOW_SIZE}-day sliding window scan...")
-    raw_hits = det.scan(df, bars, window_size=WINDOW_SIZE, step=1)
-    events   = det.merge_consecutive_hits(raw_hits, max_gap=2)
-    print(f"  {len(raw_hits)} raw window hits  ->  {len(events)} merged events\n")
+    if len(df) < WINDOW_SIZE:
+        print(
+            f"ERROR: At least {WINDOW_SIZE} daily bars "
+            f"are required."
+        )
+        sys.exit(1)
 
-    # ── Step 4: Save results and generate charts ──────────────────────────────
-    rows = []
-    for ev in events:
-        date  = df["Date"].iloc[ev["end_idx"]]
-        price = float(df["Close"].iloc[ev["end_idx"]])
-        print(f"  {ev['pattern']:<16}  {date.date()}  "
-              f"close={price:.2f}  {ev['detail']}")
+    print(
+        f"Loaded {len(df)} daily bars."
+    )
 
-        fig_path = visualize.plot_event(df, ev)
-        rows.append({
-            "Date":    date.date(),
-            "Pattern": ev["pattern"],
-            "Price":   round(price, 2),
-            **ev["detail"],
-            "Figure":  fig_path,
-        })
+    # ============================================================
+    # 4. Compute PA_Agent-style K-line features
+    # ============================================================
 
-    out_csv = "output/results.csv"
-    pd.DataFrame(rows).to_csv(out_csv, index=False)
-    print(f"\nDone.")
-    print(f"  {len(rows)} events saved  ->  {out_csv}")
-    print(f"  {len(rows)} charts saved  ->  figures/")
+    print("\nComputing Price Action features...")
+
+    features = pa_features.compute_features(
+        bars,
+        ema_period=20,
+        atr_period=14,
+    )
+
+    features_df = pd.DataFrame(features)
+
+    features_path = "output/features.csv"
+
+    features_df.to_csv(
+        features_path,
+        index=False,
+    )
+
+    print(
+        f"Price Action features saved -> {features_path}"
+    )
+
+    # ============================================================
+    # 5. Compute market structure
+    # ============================================================
+
+    print("\nComputing market structure...")
+
+    market = market_structure.compute_market_structure(
+        df,
+        bars,
+    )
+
+    market_df = pd.DataFrame(market)
+
+    market_path = "output/market_structure.csv"
+
+    market_df.to_csv(
+        market_path,
+        index=False,
+    )
+
+    print(
+        f"Market structure saved -> {market_path}"
+    )
+
+    # ============================================================
+    # 6. Detect Price Action patterns
+    # ============================================================
+
+    print(
+        f"\nRunning {WINDOW_SIZE}-day "
+        "sliding-window pattern detection..."
+    )
+
+    raw_hits = det.scan(
+        df,
+        bars,
+        window_size=WINDOW_SIZE,
+        step=1,
+    )
+
+    events = det.merge_consecutive_hits(
+        raw_hits,
+        max_gap=2,
+    )
+
+    print(
+        f"Detected {len(raw_hits)} raw hits "
+        f"-> {len(events)} events"
+    )
+
+    # ============================================================
+    # 7. Decision engine
+    # ============================================================
+
+    decisions = []
+
+    for event in events:
+
+        end_idx = event["end_idx"]
+
+        price = float(
+            df["Close"].iloc[end_idx]
+        )
+
+        feature = (
+            features[end_idx]
+            if end_idx < len(features)
+            else {}
+        )
+
+        structure = (
+            market[end_idx]
+            if end_idx < len(market)
+            else {}
+        )
+
+        decision = decision_engine.make_decision(
+            pattern=event["pattern"],
+            pattern_detail=event["detail"],
+            feature=feature,
+            market=structure,
+        )
+
+        explanation = (
+            explainability.build_explanation(
+                pattern=event["pattern"],
+                pattern_detail=event["detail"],
+                feature=feature,
+                market=structure,
+                decision=decision,
+            )
+        )
+
+        event["decision"] = decision
+        event["explanation"] = explanation
+
+        # ========================================================
+        # 8. Generate chart
+        # ========================================================
+
+        figure_path = visualize.plot_event(
+            df,
+            event,
+        )
+
+        decisions.append(
+            {
+                "Date": df["Date"].iloc[end_idx],
+                "Pattern": event["pattern"],
+                "Price": round(price, 2),
+                "Action": decision["action"],
+                "Direction": decision["direction"],
+                "Confidence": decision["confidence"],
+                "Score": decision["score"],
+                "Explanation": explanation,
+                "Figure": figure_path,
+                **event["detail"],
+            }
+        )
+
+    # ============================================================
+    # 9. Save final results
+    # ============================================================
+
+    results_path = "output/results.csv"
+
+    pd.DataFrame(decisions).to_csv(
+        results_path,
+        index=False,
+    )
+
+    print(
+        f"\nFinal results saved -> {results_path}"
+    )
+
+    print(
+        f"Charts saved -> figures/"
+    )
+
+    print("\nPipeline completed successfully.")
 
 
 if __name__ == "__main__":
